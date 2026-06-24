@@ -2,21 +2,22 @@ local MMU = require("mmu")
 local CPU = require("cpu")
 local PPU = require("ppu")
 local Joypad = require("joypad")
+local APU = require("apu")
 
--- Состояния эмулятора
 local STATE_MENU = 1
 local STATE_EMU = 2
 local current_state = STATE_MENU
 
--- Переменные меню
 local rom_list = {}
 local selected_index = 1
 
 function love.load()
+    -- Включаем vsync для идеальной плавности кадров
     love.window.setMode(640, 576, { resizable = false, vsync = true })
     love.window.setTitle("Lua GB Emulator - ROM Selector")
+    
+    APU.init()
 
-    -- Сканируем папку и собираем список всех игр .gb
     local files = love.filesystem.getDirectoryItems("")
     for _, file in ipairs(files) do
         if file:match("%.gb$") then
@@ -26,23 +27,19 @@ function love.load()
 end
 
 local function startEmulation(filename)
-    -- Загружаем игру в память
     MMU.loadROM(filename)
     
-    -- Жесткий сброс процессора на стартовые значения Game Boy
     CPU.pc = 0x0100
     CPU.sp = 0xFFFE
-    CPU.a = 0 CPU.f = 0 CPU.b = 0 CPU.c = 0 CPU.d = 0 CPU.e = 0 CPU.h = 0 CPU.l = 0
+    CPU.a = 0; CPU.f = 0; CPU.b = 0; CPU.c = 0; CPU.d = 0; CPU.e = 0; CPU.h = 0; CPU.l = 0
     CPU.ime = true
     CPU.halted = false
     CPU.halted_by_error = false
     
-    -- Аппаратная инициализация регистров
     MMU.writeByte(0xFF40, 0x91)
     MMU.writeByte(0xFF47, 0xFC)
     MMU.writeByte(0xFF44, 0x00)
 
-    -- Переключаем состояние в режим игры!
     current_state = STATE_EMU
     love.window.setTitle("Playing: " .. filename)
 end
@@ -50,34 +47,47 @@ end
 local function handleInterrupts()
     local flag = MMU.readByte(0xFF0F)
     local enable = MMU.readByte(0xFFFF)
-    if bit.band(flag, 1) ~= 0 and bit.band(enable, 1) ~= 0 then
+    local triggered = bit.band(flag, enable)
+
+    if triggered > 0 then
+        CPU.halted = false 
         if CPU.ime then
-            CPU.ime = false
-            CPU.halted = false
-            MMU.writeByte(0xFF0F, bit.band(flag, bit.bnot(1)))
-            CPU.sp = bit.band(CPU.sp - 1, 0xFFFF)
-            MMU.writeByte(CPU.sp, bit.band(bit.rshift(CPU.pc, 8), 0xFF))
-            CPU.sp = bit.band(CPU.sp - 1, 0xFFFF)
-            MMU.writeByte(CPU.sp, bit.band(CPU.pc, 0xFF))
-            CPU.pc = 0x0040
+            for bit_idx = 0, 4 do
+                local mask = bit.lshift(1, bit_idx)
+                if bit.band(triggered, mask) ~= 0 then
+                    CPU.ime = false
+                    MMU.writeByte(0xFF0F, bit.band(flag, bit.bnot(mask)))
+                    
+                    local high = bit.band(bit.rshift(CPU.pc, 8), 0xFF)
+                    local low = bit.band(CPU.pc, 0xFF)
+                    CPU.sp = bit.band(CPU.sp - 1, 0xFFFF)
+                    MMU.writeByte(CPU.sp, high)
+                    CPU.sp = bit.band(CPU.sp - 1, 0xFFFF)
+                    MMU.writeByte(CPU.sp, low)
+                    
+                    CPU.pc = 0x0040 + (bit_idx * 8)
+                    break
+                end
+            end
         end
     end
 end
 
 function love.update(dt)
-    if current_state == STATE_MENU then
-        -- В меню ничего не симулируем, процессор спит
-        return
-    end
-
+    if current_state == STATE_MENU then return end
     if CPU.halted_by_error then return end
 
-    local cycles_per_frame = 70224
+    -- Ограничиваем шаг времени при лагах или перетаскивании окна
+    if dt > 0.1 then dt = 0.1 end
+
+    -- Рассчитываем точное количество тактов процессора для текущей дельты времени (4.194304 МГц)
+    local cycles_to_run = math.floor(4194304 * dt)
     local cycles_spent = 0
+    
     local current_ly = MMU.readByte(0xFF44)
     local line_cycles = 0
 
-    while cycles_spent < cycles_per_frame do
+    while cycles_spent < cycles_to_run do
         Joypad.update()
         handleInterrupts()
         
@@ -112,12 +122,15 @@ function love.update(dt)
             break
         end
     end
+
+    if current_state == STATE_EMU then
+        APU.generateFrameAudio()
+    end
 end
 
 function love.draw()
     if current_state == STATE_MENU then
-        -- ОТРИСОВКА КРАСИВОГО МЕНЮ
-        love.graphics.clear(0.08, 0.12, 0.08) -- Ретро-зеленый оттенок
+        love.graphics.clear(0.08, 0.12, 0.08)
         love.graphics.setColor(0.3, 0.8, 0.3)
         love.graphics.printf("LUA GAME BOY EMULATOR", 0, 40, 640, "center", 0, 1.5, 1.5, 213)
         love.graphics.setColor(0.5, 0.5, 0.5)
@@ -143,15 +156,11 @@ function love.draw()
                 end
             end
         end
-
         love.graphics.setColor(0.4, 0.4, 0.4)
         love.graphics.printf("Press ESC to exit", 0, 520, 640, "center")
     else
-        -- ОТРИСОВКА ИГРЫ
         love.graphics.clear(0.1, 0.1, 0.1)
         PPU.draw()
-        
-        -- Компактная плашка отладки при игре
         if CPU.halted_by_error then
             love.graphics.setColor(0.8, 0.2, 0.2, 0.8)
             love.graphics.rectangle("fill", 10, 10, 620, 60)
@@ -164,7 +173,6 @@ end
 
 function love.keypressed(key)
     if current_state == STATE_MENU then
-        -- Навигация в меню
         if key == "up" then
             selected_index = selected_index - 1
             if selected_index < 1 then selected_index = #rom_list end
@@ -172,15 +180,12 @@ function love.keypressed(key)
             selected_index = selected_index + 1
             if selected_index > #rom_list then selected_index = 1 end
         elseif key == "return" and #rom_list > 0 then
-            -- Запускаем выбранную игру по нажатию Enter!
             startEmulation(rom_list[selected_index])
         elseif key == "escape" then
             love.event.quit()
         end
     else
-        -- Горячие клавиши в режиме игры
         if key == "escape" then
-            -- По кнопке ESC возвращаемся обратно в меню выбора игр!
             current_state = STATE_MENU
             love.window.setTitle("Lua GB Emulator - ROM Selector")
         end

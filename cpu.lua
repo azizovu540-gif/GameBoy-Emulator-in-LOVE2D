@@ -86,6 +86,7 @@ local setReg = {
 local pairsGet = { CPU.getBC, CPU.getDE, CPU.getHL, function() return CPU.sp end }
 local pairsSet = { CPU.setBC, CPU.setDE, CPU.setHL, function(v) CPU.sp = v end }
 
+-- ИСПРАВЛЕНО: Нижние 4 бита регистра флагов F в Game Boy всегда должны быть равны 0
 local pairsStackSet = { 
     CPU.setBC, 
     CPU.setDE, 
@@ -102,12 +103,10 @@ local ccCheck = {
     function() return not CPU.getFlag(FLAG_C) end, 
     function() return CPU.getFlag(FLAG_C) end 
 }
-
 -- Главный массив опкодов
 local opcodes = {}
 for i = 0, 255 do opcodes[i] = function() error(string.format("Opcode 0x%02X not wired", i)) end end
 
--- Оставляем место для подгрузки остальных частей кода
 -- 1. Группа опкодов загрузки (LD r, r') — всего 64 штуки (0x40 - 0x7F)
 for r = 0, 7 do
     for r_prime = 0, 7 do
@@ -162,6 +161,103 @@ for r = 0, 7 do
     end
 end
 
+-------------------------------------------------------------------
+-- ГЕНЕРАЦИЯ ВТОРОЙ ТАБЛИЦЫ: PREFIX CB (ИСПРАВЛЕНО!)
+-------------------------------------------------------------------
+local opcodes_CB = {}
+local function cb_get(r) return getReg[r + 1]() end
+local function cb_set(r, v) setReg[r + 1](bit.band(v, 0xFF)) end
+
+for r = 0, 7 do
+    for b = 0, 7 do
+        -- Проверки битов (BIT b, r)
+        opcodes_CB[0x40 + b*8 + r] = function()
+            local bit_set = bit.band(cb_get(r), bit.lshift(1, b)) ~= 0
+            CPU.setFlag(FLAG_Z, not bit_set) CPU.setFlag(FLAG_N, false) CPU.setFlag(FLAG_H, true)
+            return r == 6 and 12 or 8
+        end
+        -- Сброс битов (RES b, r)
+        opcodes_CB[0x80 + b*8 + r] = function() cb_set(r, bit.band(cb_get(r), bit.bnot(bit.lshift(1, b)))) return r == 6 and 16 or 8 end
+        -- Установка битов (SET b, r)
+        opcodes_CB[0xC0 + b*8 + r] = function() cb_set(r, bit.bor(cb_get(r), bit.lshift(1, b))) return r == 6 and 16 or 8 end
+    end
+
+    -- Битовые сдвиги и SWAP (ИСПРАВЛЕНЫ ТАЙМИНГИ И ФЛАГИ!)
+    opcodes_CB[0x00 + r] = function() 
+        local v = cb_get(r) local c = bit.band(v, 0x80) ~= 0 
+        v = bit.bor(bit.lshift(v, 1), c and 1 or 0) cb_set(r, v) 
+        CPU.setFlag(FLAG_Z, bit.band(v, 0xFF) == 0) CPU.setFlag(FLAG_N, false) CPU.setFlag(FLAG_H, false) CPU.setFlag(FLAG_C, c)
+        return r == 6 and 16 or 8 
+    end
+    opcodes_CB[0x08 + r] = function() 
+        local v = cb_get(r) local c = bit.band(v, 0x01) ~= 0 
+        v = bit.bor(bit.rshift(v, 1), c and 0x80 or 0) cb_set(r, v) 
+        CPU.setFlag(FLAG_Z, bit.band(v, 0xFF) == 0) CPU.setFlag(FLAG_N, false) CPU.setFlag(FLAG_H, false) CPU.setFlag(FLAG_C, c)
+        return r == 6 and 16 or 8 
+    end
+    opcodes_CB[0x10 + r] = function() 
+        local v = cb_get(r) local c = bit.band(v, 0x80) ~= 0 local old_c = CPU.getFlag(FLAG_C) and 1 or 0 
+        v = bit.bor(bit.lshift(v, 1), old_c) cb_set(r, v) 
+        CPU.setFlag(FLAG_Z, bit.band(v, 0xFF) == 0) CPU.setFlag(FLAG_N, false) CPU.setFlag(FLAG_H, false) CPU.setFlag(FLAG_C, c)
+        return r == 6 and 16 or 8 
+    end
+    opcodes_CB[0x18 + r] = function() 
+        local v = cb_get(r) local c = bit.band(v, 0x01) ~= 0 local old_c = CPU.getFlag(FLAG_C) and 0x80 or 0 
+        v = bit.bor(bit.rshift(v, 1), old_c) cb_set(r, v) 
+        CPU.setFlag(FLAG_Z, bit.band(v, 0xFF) == 0) CPU.setFlag(FLAG_N, false) CPU.setFlag(FLAG_H, false) CPU.setFlag(FLAG_C, c)
+        return r == 6 and 16 or 8 
+    end
+    
+    -- SLA r
+    opcodes_CB[0x20 + r] = function() 
+        local v = cb_get(r) local c = bit.band(v, 0x80) ~= 0 
+        v = bit.lshift(v, 1) cb_set(r, v) 
+        CPU.setFlag(FLAG_Z, bit.band(v, 0xFF) == 0) CPU.setFlag(FLAG_N, false) CPU.setFlag(FLAG_H, false) CPU.setFlag(FLAG_C, c)
+        return r == 6 and 16 or 8 
+    end
+    -- SRA r
+    opcodes_CB[0x28 + r] = function() 
+        local v = cb_get(r) local c = bit.band(v, 0x01) ~= 0 local sign = bit.band(v, 0x80) 
+        v = bit.bor(bit.rshift(v, 1), sign) cb_set(r, v) 
+        CPU.setFlag(FLAG_Z, bit.band(v, 0xFF) == 0) CPU.setFlag(FLAG_N, false) CPU.setFlag(FLAG_H, false) CPU.setFlag(FLAG_C, c)
+        return r == 6 and 16 or 8 
+    end
+    
+    -- SWAP r 
+    opcodes_CB[0x30 + r] = function()
+        local v = cb_get(r)
+        local low = bit.band(v, 0x0F)
+        local high = bit.band(v, 0xF0)
+        local res = bit.bor(bit.lshift(low, 4), bit.rshift(high, 4))
+        cb_set(r, res)
+        CPU.setFlag(FLAG_Z, res == 0) CPU.setFlag(FLAG_N, false) CPU.setFlag(FLAG_H, false) CPU.setFlag(FLAG_C, false)
+        return r == 6 and 16 or 8
+    end
+    
+    -- SRL r
+    opcodes_CB[0x38 + r] = function() 
+        local v = cb_get(r) local c = bit.band(v, 0x01) ~= 0 
+        v = bit.rshift(v, 1) cb_set(r, v) 
+        CPU.setFlag(FLAG_Z, v == 0) CPU.setFlag(FLAG_N, false) CPU.setFlag(FLAG_H, false) CPU.setFlag(FLAG_C, c)
+        return r == 6 and 16 or 8 
+    end
+end
+
+-- 16-битное сложение (ADD HL, BC/DE/HL/SP)
+for i = 0, 3 do
+    opcodes[0x09 + i*16] = function()
+        local hl = CPU.getHL()
+        local val = pairsGet[i + 1]()
+        local res = hl + val
+        
+        CPU.setFlag(FLAG_N, false)
+        CPU.setFlag(FLAG_H, bit.band(hl, 0x0FFF) + bit.band(val, 0x0FFF) > 0x0FFF)
+        CPU.setFlag(FLAG_C, res > 0xFFFF)
+        
+        CPU.setHL(bit.band(res, 0xFFFF))
+        return 8
+    end
+end
 -- 1. Специфические одиночные инструкции
 opcodes[0x00] = function() return 4 end -- NOP
 opcodes[0x76] = function() CPU.halted = true return 4 end -- HALT
@@ -252,7 +348,8 @@ opcodes[0x22] = function() local hl = CPU.getHL() MMU.writeByte(hl, CPU.a) CPU.s
 opcodes[0x32] = function() local hl = CPU.getHL() MMU.writeByte(hl, CPU.a) CPU.setHL(hl - 1) return 8 end
 opcodes[0x2A] = function() local hl = CPU.getHL() CPU.a = MMU.readByte(hl) CPU.setHL(hl + 1) return 8 end
 opcodes[0x3A] = function() local hl = CPU.getHL() CPU.a = MMU.readByte(hl) CPU.setHL(hl - 1) return 8 end
--- 1. Непосредственные вызовы арифметики (ADD A, d8; SUB d8 и т.д.)
+
+-- 8. Непосредственные вызовы арифметики (ADD A, d8; SUB d8 и т.д.)
 opcodes[0xC6] = function() do_add(MMU.readByte(CPU.pc), false) CPU.pc = CPU.pc + 1 return 8 end
 opcodes[0xCE] = function() do_add(MMU.readByte(CPU.pc), true) CPU.pc = CPU.pc + 1 return 8 end
 opcodes[0xD6] = function() do_sub(MMU.readByte(CPU.pc), false) CPU.pc = CPU.pc + 1 return 8 end
@@ -262,11 +359,11 @@ opcodes[0xEE] = function() CPU.a = bit.bxor(CPU.a, MMU.readByte(CPU.pc)) CPU.pc 
 opcodes[0xF6] = function() CPU.a = bit.bor(CPU.a, MMU.readByte(CPU.pc)) CPU.pc = CPU.pc + 1 CPU.setFlag(FLAG_Z, CPU.a==0) CPU.setFlag(FLAG_N, false) CPU.setFlag(FLAG_H, false) CPU.setFlag(FLAG_C, false) return 8 end
 opcodes[0xFE] = function() local v = MMU.readByte(CPU.pc) CPU.pc = CPU.pc + 1 CPU.setFlag(FLAG_Z, CPU.a == v) CPU.setFlag(FLAG_N, true) CPU.setFlag(FLAG_H, bit.band(CPU.a, 0x0F) < bit.band(v, 0x0F)) CPU.setFlag(FLAG_C, CPU.a < v) return 8 end
 
--- 2. Команды перезагрузки процессора RST и выход из прерываний RETI
+-- 9. Команды перезагрузки процессора RST и выход из прерываний RETI
 for i = 0, 7 do opcodes[0xC7 + i*8] = function() pushWord(CPU.pc) CPU.pc = i * 8 return 16 end end
 opcodes[0xD9] = function() CPU.pc = popWord() CPU.ime = true return 16 end
 
--- 3. Сдвиги аккумулятора, инверсия флагов и DAA (десятичная коррекция для Тетриса)
+-- 10. Сдвиги аккумулятора, инверсия флагов и DAA (десятичная коррекция для Тетриса)
 opcodes[0x07] = function() local c = bit.band(CPU.a, 0x80) ~= 0 CPU.a = bit.band(bit.bor(bit.lshift(CPU.a, 1), c and 1 or 0), 0xFF) CPU.f = 0 CPU.setFlag(FLAG_C, c) return 4 end
 opcodes[0x17] = function() local c = bit.band(CPU.a, 0x80) ~= 0 local old_c = CPU.getFlag(FLAG_C) and 1 or 0 CPU.a = bit.band(bit.bor(bit.lshift(CPU.a, 1), old_c), 0xFF) CPU.f = 0 CPU.setFlag(FLAG_C, c) return 4 end
 opcodes[0x0F] = function() local c = bit.band(CPU.a, 0x01) ~= 0 CPU.a = bit.band(bit.bor(bit.rshift(CPU.a, 1), c and 0x80 or 0), 0xFF) CPU.f = 0 CPU.setFlag(FLAG_C, c) return 4 end
@@ -286,55 +383,7 @@ opcodes[0x27] = function()
     CPU.a = bit.band(a, 0xFF) CPU.setFlag(FLAG_Z, CPU.a == 0) CPU.setFlag(FLAG_H, false) return 4
 end
 
--------------------------------------------------------------------
--- ГЕНЕРАЦИЯ ВТОРОЙ ТАБЛИЦЫ: PREFIX CB (Исправлено!)
--------------------------------------------------------------------
-local opcodes_CB = {}
-local function cb_get(r) return getReg[r + 1]() end
-local function cb_set(r, v) setReg[r + 1](bit.band(v, 0xFF)) end
-
-for r = 0, 7 do
-    for b = 0, 7 do
-        -- Проверки битов (BIT b, r)
-        opcodes_CB[0x40 + b*8 + r] = function()
-            local bit_set = bit.band(cb_get(r), bit.lshift(1, b)) ~= 0
-            CPU.setFlag(FLAG_Z, not bit_set) CPU.setFlag(FLAG_N, false) CPU.setFlag(FLAG_H, true)
-            return r == 6 and 12 or 8
-        end
-        -- Сброс битов (RES b, r)
-        opcodes_CB[0x80 + b*8 + r] = function() cb_set(r, bit.band(cb_get(r), bit.bnot(bit.lshift(1, b)))) return r == 6 and 16 or 8 end
-        -- Установка битов (SET b, r)
-        opcodes_CB[0xC0 + b*8 + r] = function() cb_set(r, bit.bor(cb_get(r), bit.lshift(1, b))) return r == 6 and 16 or 8 end
-    end
-
-    -- Битовые сдвиги и SWAP (Все группы добавлены корректно!)
-    opcodes_CB[0x00 + r] = function() local v = cb_get(r) local c = bit.band(v, 0x80) ~= 0 v = bit.bor(bit.lshift(v, 1), c and 1 or 0) cb_set(r, v) CPU.f = 0 CPU.setFlag(FLAG_Z, bit.band(v,0xFF)==0) CPU.setFlag(FLAG_C, c) return r==6 and 15 or 8 end
-    opcodes_CB[0x08 + r] = function() local v = cb_get(r) local c = bit.band(v, 0x01) ~= 0 v = bit.bor(bit.rshift(v, 1), c and 0x80 or 0) cb_set(r, v) CPU.f = 0 CPU.setFlag(FLAG_Z, bit.band(v,0xFF)==0) CPU.setFlag(FLAG_C, c) return r==6 and 15 or 8 end
-    opcodes_CB[0x10 + r] = function() local v = cb_get(r) local c = bit.band(v, 0x80) ~= 0 local old_c = CPU.getFlag(FLAG_C) and 1 or 0 v = bit.bor(bit.lshift(v, 1), old_c) cb_set(r, v) CPU.f = 0 CPU.setFlag(FLAG_Z, bit.band(v,0xFF)==0) CPU.setFlag(FLAG_C, c) return r==6 and 15 or 8 end
-    opcodes_CB[0x18 + r] = function() local v = cb_get(r) local c = bit.band(v, 0x01) ~= 0 local old_c = CPU.getFlag(FLAG_C) and 0x80 or 0 v = bit.bor(bit.rshift(v, 1), old_c) cb_set(r, v) CPU.f = 0 CPU.setFlag(FLAG_Z, bit.band(v,0xFF)==0) CPU.setFlag(FLAG_C, c) return r==6 and 15 or 8 end
-    
-    -- SLA r
-    opcodes_CB[0x20 + r] = function() local v = cb_get(r) local c = bit.band(v, 0x80) ~= 0 v = bit.lshift(v, 1) cb_set(r, v) CPU.f = 0 CPU.setFlag(FLAG_Z, bit.band(v,0xFF)==0) CPU.setFlag(FLAG_C, c) return r==6 and 15 or 8 end
-    -- SRA r
-    opcodes_CB[0x28 + r] = function() local v = cb_get(r) local c = bit.band(v, 0x01) ~= 0 local sign = bit.band(v, 0x80) v = bit.bor(bit.rshift(v, 1), sign) cb_set(r, v) CPU.f = 0 CPU.setFlag(FLAG_Z, bit.band(v,0xFF)==0) CPU.setFlag(FLAG_C, c) return r==6 and 15 or 8 end
-    
-    -- SWAP r (Половинки байта меняются местами)
-    opcodes_CB[0x30 + r] = function()
-        local v = cb_get(r)
-        local low = bit.band(v, 0x0F)
-        local high = bit.band(v, 0xF0)
-        local res = bit.bor(bit.lshift(low, 4), bit.rshift(high, 4))
-        cb_set(r, res)
-        CPU.f = 0
-        CPU.setFlag(FLAG_Z, res == 0)
-        return r==6 and 15 or 8
-    end
-    
-    -- SRL r
-    opcodes_CB[0x38 + r] = function() local v = cb_get(r) local c = bit.band(v, 0x01) ~= 0 v = bit.rshift(v, 1) cb_set(r, v) CPU.f = 0 CPU.setFlag(FLAG_Z, v==0) CPU.setFlag(FLAG_C, c) return r==6 and 15 or 8 end
-end
-
--- Исправленная фиксация опкодов 0x08 и префикса CB
+-- Перехват опкодов 0x08, STOP и CB префикса
 opcodes[0x08] = function() 
     local addr = readWord(CPU.pc) CPU.pc = CPU.pc + 2 
     MMU.writeByte(addr, bit.band(CPU.sp, 0xFF)) 
@@ -351,25 +400,7 @@ opcodes[0xCB] = function()
     if func then return func() else error(string.format("Unknown CB opcode 0x%02X", cb_op)) end
 end
 
-    -- 16-битное сложение (ADD HL, BC/DE/HL/SP)
-for i = 0, 3 do
-    opcodes[0x09 + i*16] = function()
-        local hl = CPU.getHL()
-        local val = pairsGet[i + 1]()
-        local res = hl + val
-        
-        CPU.setFlag(FLAG_N, false)
-        CPU.setFlag(FLAG_H, bit.band(hl, 0x0FFF) + bit.band(val, 0x0FFF) > 0x0FFF)
-        CPU.setFlag(FLAG_C, res > 0xFFFF)
-        
-        CPU.setHL(bit.band(res, 0xFFFF))
-        return 8
-    end
-end
-
-
-
--- [0xE9] JP (HL): Прыгнуть по адресу, записанному в HL
+-- [0xE9] JP (HL)
 opcodes[0xE9] = function()
     CPU.pc = CPU.getHL()
     return 4
@@ -378,12 +409,8 @@ end
 -------------------------------------------------------------------
 -- ГЛАВНЫЙ ШАГ СИМУЛЯЦИИ
 -------------------------------------------------------------------
-
-
 function CPU.step()
     if CPU.halted then return 4 end
-
-
 
     local current_pc = CPU.pc
     local opcode = MMU.readByte(CPU.pc)

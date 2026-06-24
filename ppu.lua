@@ -3,21 +3,24 @@ local MMU = require("mmu")
 
 local PPU = {
     imageData = love.image.newImageData(160, 144),
+    image = nil,
     palette = {
-        [0] = {224, 248, 208}, -- Самый светлый (белый/зеленый)
-        [1] = {136, 192, 112}, -- Светло-серый
-        [2] = {52, 104, 86},   -- Темно-серый
-        [3] = {8, 24, 32}      -- Черный
+        [0] = {224, 248, 208},
+        [1] = {136, 192, 112},
+        [2] = {52, 104, 86},
+        [3] = {8, 24, 32}
     }
 }
 
+PPU.image = love.graphics.newImage(PPU.imageData)
+PPU.image:setFilter("nearest", "nearest")
+
 function PPU.renderLine(ly)
     local lcdc = MMU.readByte(0xFF40)
-    if bit.band(lcdc, 0x80) == 0 then return end -- Экран выключен
+    if bit.band(lcdc, 0x80) == 0 then return end
 
     local bgp = MMU.readByte(0xFF47)
 
-    -- 1. РЕНДЕРИНГ ФОНА И ОКНА (С ПЛАВНЫМ ПИКСЕЛЬНЫМ СКРОЛЛИНГОМ)
     if bit.band(lcdc, 0x01) ~= 0 then
         local wy = MMU.readByte(0xFF4A)
         local wx = MMU.readByte(0xFF4B)
@@ -28,13 +31,11 @@ function PPU.renderLine(ly)
         local scy = MMU.readByte(0xFF42)
         local scx = MMU.readByte(0xFF43)
 
-        -- Базовые адреса карт тайлов
         local bg_map_base = bit.band(lcdc, 0x08) ~= 0 and 0x1C00 or 0x1800
         local win_map_base = bit.band(lcdc, 0x40) ~= 0 and 0x1C00 or 0x1800
 
         for cx = 0, 159 do
             local use_window = is_window_visible and cx >= wx
-            
             local x_pos, y_pos, map_base
             if use_window then
                 x_pos = cx - wx
@@ -54,16 +55,11 @@ function PPU.renderLine(ly)
             local map_addr = map_base + (tile_row * 32) + tile_col
             local tile_index = MMU.readByte(0x8000 + map_addr)
 
-            -- Честный выбор режима адресации тайлов в VRAM
             local tile_addr = 0
             if bit.band(lcdc, 0x10) ~= 0 then
-                -- Режим $8000: Индекс беззнаковый (0 до 255)
                 tile_addr = tile_index * 16
             else
-                -- Режим $8800: Индекс знаковый (-128 до 127)
-                if tile_index >= 128 then 
-                    tile_index = tile_index - 256 
-                end
+                if tile_index >= 128 then tile_index = tile_index - 256 end
                 tile_addr = 0x1000 + (tile_index * 16)
             end
             
@@ -81,7 +77,6 @@ function PPU.renderLine(ly)
         end
     end
 
-    -- 2. РЕНДЕРИНГ СПРАЙТОВ (OBJ)
     if bit.band(lcdc, 0x02) ~= 0 then
         for i = 0, 39 do
             local oam_base = i * 4
@@ -89,21 +84,14 @@ function PPU.renderLine(ly)
             local sprite_x = MMU.readByte(0xFE00 + oam_base + 1) - 8
             local tile_index = MMU.readByte(0xFE00 + oam_base + 2)
             local attributes = MMU.readByte(0xFE00 + oam_base + 3)
-
             local sprite_height = bit.band(lcdc, 0x04) ~= 0 and 16 or 8
 
             if ly >= sprite_y and ly < (sprite_y + sprite_height) then
                 local palette_addr = bit.band(attributes, 0x10) ~= 0 and 0xFF49 or 0xFF48
                 local obp = MMU.readByte(palette_addr)
-
                 local tile_line = ly - sprite_y
-                if bit.band(attributes, 0x40) ~= 0 then
-                    tile_line = sprite_height - 1 - tile_line
-                end
-
-                if sprite_height == 16 then
-                    tile_index = bit.band(tile_index, 0xFE)
-                end
+                if bit.band(attributes, 0x40) ~= 0 then tile_line = sprite_height - 1 - tile_line end
+                if sprite_height == 16 then tile_index = bit.band(tile_index, 0xFE) end
 
                 local addr = (tile_index * 16) + (tile_line * 2)
                 local byte1 = MMU.readByte(0x8000 + addr)
@@ -113,9 +101,7 @@ function PPU.renderLine(ly)
                     local pixel_x = sprite_x + cx
                     if pixel_x >= 0 and pixel_x < 160 then
                         local tile_pixel = 7 - cx
-                        if bit.band(attributes, 0x20) ~= 0 then
-                            tile_pixel = cx
-                        end
+                        if bit.band(attributes, 0x20) ~= 0 then tile_pixel = cx end
 
                         local bit1 = bit.band(bit.rshift(byte1, tile_pixel), 1)
                         local bit2 = bit.band(bit.rshift(byte2, tile_pixel), 1)
@@ -134,9 +120,8 @@ function PPU.renderLine(ly)
 end
 
 function PPU.draw()
-    local image = love.graphics.newImage(PPU.imageData)
-    image:setFilter("nearest", "nearest")
-    love.graphics.draw(image, 0, 0, 0, 4, 4)
+    PPU.image:replacePixels(PPU.imageData)
+    love.graphics.draw(PPU.image, 0, 0, 0, 4, 4)
 end
 
 return PPU
