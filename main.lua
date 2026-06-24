@@ -1,8 +1,16 @@
+if jit then jit.on() jit.opt.start("hotloop=10", "hotexit=2") end
+
 local MMU = require("mmu")
 local CPU = require("cpu")
 local PPU = require("ppu")
 local Joypad = require("joypad")
 local APU = require("apu")
+
+-- Быстрые локальные ссылки для критического цикла процессора
+local cpu_step = CPU.step
+local mmu_read = MMU.readByte
+local mmu_write = MMU.writeByte
+local ppu_render = PPU.renderLine
 
 local STATE_MENU = 1
 local STATE_EMU = 2
@@ -10,6 +18,7 @@ local current_state = STATE_MENU
 
 local rom_list = {}
 local selected_index = 1
+local current_rom_filename = ""
 
 function love.load()
     -- Включаем vsync для идеальной плавности кадров
@@ -27,6 +36,7 @@ function love.load()
 end
 
 local function startEmulation(filename)
+    current_rom_filename = filename
     MMU.loadROM(filename)
     
     CPU.pc = 0x0100
@@ -36,17 +46,84 @@ local function startEmulation(filename)
     CPU.halted = false
     CPU.halted_by_error = false
     
-    MMU.writeByte(0xFF40, 0x91)
-    MMU.writeByte(0xFF47, 0xFC)
-    MMU.writeByte(0xFF44, 0x00)
+    mmu_write(0xFF40, 0x91)
+    mmu_write(0xFF47, 0xFC)
+    mmu_write(0xFF44, 0x00)
 
     current_state = STATE_EMU
     love.window.setTitle("Playing: " .. filename)
 end
 
+-- Вспомогательная функция физической записи файла быстрого сохранения (Save State)
+local function executeSave()
+    local cpuState = {
+        a = CPU.a, f = CPU.f, b = CPU.b, c = CPU.c,
+        d = CPU.d, e = CPU.e, h = CPU.h, l = CPU.l,
+        pc = CPU.pc, sp = CPU.sp, ime = CPU.ime and 1 or 0,
+        halted = CPU.halted and 1 or 0
+    }
+    
+    local mmuData = MMU.saveState()
+    
+    -- Упаковываем состояние процессора в текстовый заголовок в начале файла
+    local cpuHeader = string.format("%02X|%02X|%02X|%02X|%02X|%02X|%02X|%02X|%04X|%04X|%d|%d\n",
+        cpuState.a, cpuState.f, cpuState.b, cpuState.c,
+        cpuState.d, cpuState.e, cpuState.h, cpuState.l,
+        cpuState.pc, cpuState.sp, cpuState.ime, cpuState.halted
+    )
+    
+    local save_name = current_rom_filename:gsub("%.gb$", "") .. ".state"
+    local success = love.filesystem.write(save_name, cpuHeader .. mmuData)
+    if success then
+        print("Save State успешно создан: " .. save_name)
+    end
+end
+
+-- Вспомогательная функция чтения файла быстрого сохранения (Load State)
+local function executeLoad()
+    local save_name = current_rom_filename:gsub("%.gb$", "") .. ".state"
+    if love.filesystem.getInfo(save_name) then
+        local fileData = love.filesystem.read(save_name)
+        local newlineIndex = fileData:find("\n")
+        
+        if newlineIndex then
+            local header = fileData:sub(1, newlineIndex - 1)
+            local mmuData = fileData:sub(newlineIndex + 1)
+            
+            -- Восстанавливаем массивы оперативной памяти через MMU
+            local mmuSuccess = MMU.loadState(mmuData)
+            
+            if mmuSuccess then
+                -- Восстанавливаем внутреннее состояние регистров процессора
+                local parts = {}
+                for token in string.gmatch(header, "[^|]+") do
+                    table.insert(parts, token)
+                end
+                
+                CPU.a = tonumber(parts[1], 16)
+                CPU.f = tonumber(parts[2], 16)
+                CPU.b = tonumber(parts[3], 16)
+                CPU.c = tonumber(parts[4], 16)
+                CPU.d = tonumber(parts[5], 16)
+                CPU.e = tonumber(parts[6], 16)
+                CPU.h = tonumber(parts[7], 16)
+                CPU.l = tonumber(parts[8], 16)
+                CPU.pc = tonumber(parts[9], 16)
+                CPU.sp = tonumber(parts[10], 16)
+                CPU.ime = (tonumber(parts[11]) == 1)
+                CPU.halted = (tonumber(parts[12]) == 1)
+                
+                print("Save State успешно загружен!")
+            end
+        end
+    else
+        print("Файл сохранения не найден!")
+    end
+end
+
 local function handleInterrupts()
-    local flag = MMU.readByte(0xFF0F)
-    local enable = MMU.readByte(0xFFFF)
+    local flag = mmu_read(0xFF0F)
+    local enable = mmu_read(0xFFFF)
     local triggered = bit.band(flag, enable)
 
     if triggered > 0 then
@@ -56,14 +133,14 @@ local function handleInterrupts()
                 local mask = bit.lshift(1, bit_idx)
                 if bit.band(triggered, mask) ~= 0 then
                     CPU.ime = false
-                    MMU.writeByte(0xFF0F, bit.band(flag, bit.bnot(mask)))
+                    mmu_write(0xFF0F, bit.band(flag, bit.bnot(mask)))
                     
                     local high = bit.band(bit.rshift(CPU.pc, 8), 0xFF)
                     local low = bit.band(CPU.pc, 0xFF)
                     CPU.sp = bit.band(CPU.sp - 1, 0xFFFF)
-                    MMU.writeByte(CPU.sp, high)
+                    mmu_write(CPU.sp, high)
                     CPU.sp = bit.band(CPU.sp - 1, 0xFFFF)
-                    MMU.writeByte(CPU.sp, low)
+                    mmu_write(CPU.sp, low)
                     
                     CPU.pc = 0x0040 + (bit_idx * 8)
                     break
@@ -77,49 +154,45 @@ function love.update(dt)
     if current_state == STATE_MENU then return end
     if CPU.halted_by_error then return end
 
-    -- Ограничиваем шаг времени при лагах или перетаскивании окна
-    if dt > 0.1 then dt = 0.1 end
+    -- Жестко ограничиваем шаг времени во избежание зависаний (макс 30 FPS на шаг)
+    if dt > 0.033 then dt = 0.033 end
 
     -- Рассчитываем точное количество тактов процессора для текущей дельты времени (4.194304 МГц)
     local cycles_to_run = math.floor(4194304 * dt)
     local cycles_spent = 0
     
-    local current_ly = MMU.readByte(0xFF44)
+    local current_ly = mmu_read(0xFF44)
     local line_cycles = 0
 
     while cycles_spent < cycles_to_run do
-        Joypad.update()
         handleInterrupts()
         
-        local success, cycles_or_err = pcall(CPU.step)
-        if success then
-            local cycles = cycles_or_err or 4
-            cycles_spent = cycles_spent + cycles
-            line_cycles = line_cycles + cycles
+        -- Прямой вызов без pcall ради максимальной скорости (Full 60 FPS)
+        local cycles = cpu_step() or 4
+        cycles_spent = cycles_spent + cycles
+        line_cycles = line_cycles + cycles
 
-            local stat = MMU.readByte(0xFF41)
-            if current_ly >= 144 then stat = bit.bor(bit.band(stat, 0xFC), 1)
-            elseif line_cycles < 80 then stat = bit.bor(bit.band(stat, 0xFC), 2)
-            elseif line_cycles < 252 then stat = bit.bor(bit.band(stat, 0xFC), 3)
-            else stat = bit.band(stat, 0xFC) end
-            MMU.writeByte(0xFF41, stat)
+        local stat = mmu_read(0xFF41)
+        if current_ly >= 144 then stat = bit.bor(bit.band(stat, 0xFC), 1)
+        elseif line_cycles < 80 then stat = bit.bor(bit.band(stat, 0xFC), 2)
+        elseif line_cycles < 252 then stat = bit.bor(bit.band(stat, 0xFC), 3)
+        else stat = bit.band(stat, 0xFC) end
+        mmu_write(0xFF41, stat)
 
-            if line_cycles >= 456 then
-                line_cycles = line_cycles - 456
-                current_ly = current_ly + 1
-                if current_ly == 144 then
-                    local flag = MMU.readByte(0xFF0F)
-                    MMU.writeByte(0xFF0F, bit.bor(flag, 1))
-                elseif current_ly > 153 then
-                    current_ly = 0
-                end
-                MMU.writeByte(0xFF44, current_ly)
-                if current_ly <= 143 then PPU.renderLine(current_ly) end
+        if line_cycles >= 456 then
+            -- Опрашиваем джойпад один раз на отрисовку строки, а не на каждый такт
+            Joypad.update()
+
+            line_cycles = line_cycles - 456
+            current_ly = current_ly + 1
+            if current_ly == 144 then
+                local flag = mmu_read(0xFF0F)
+                mmu_write(0xFF0F, bit.bor(flag, 1))
+            elseif current_ly > 153 then
+                current_ly = 0
             end
-        else
-            CPU.halted_by_error = true
-            CPU.error_message = cycles_or_err
-            break
+            mmu_write(0xFF44, current_ly)
+            if current_ly <= 143 then ppu_render(current_ly) end
         end
     end
 
@@ -171,6 +244,7 @@ function love.draw()
     end
 end
 
+-- Обработка управления с клавиатуры ПК
 function love.keypressed(key)
     if current_state == STATE_MENU then
         if key == "up" then
@@ -188,6 +262,33 @@ function love.keypressed(key)
         if key == "escape" then
             current_state = STATE_MENU
             love.window.setTitle("Lua GB Emulator - ROM Selector")
+        elseif key == "f5" then
+            executeSave()
+        elseif key == "f6" then
+            executeLoad()
+        end
+    end
+end
+
+-- Обработка управления с внешнего геймпада (XInput / Xbox / DualShock)
+function love.gamepadpressed(joystick, button)
+    if current_state == STATE_MENU then
+        if button == "dpup" then
+            selected_index = selected_index - 1
+            if selected_index < 1 then selected_index = #rom_list end
+        elseif button == "dpdown" then
+            if selected_index > #rom_list then selected_index = 1 end
+        elseif button == "a" and #rom_list > 0 then
+            startEmulation(rom_list[selected_index])
+        end
+    else
+        -- Горячие кнопки сохранения/загрузки для геймпада во время игры
+        if joystick:isGamepadDown("leftshoulder") then -- Удерживаем L1
+            if button == "y" then
+                executeSave() -- L1 + Y -> Быстрое сохранение
+            elseif button == "x" then
+                executeLoad() -- L1 + X -> Быстрая загрузка
+            end
         end
     end
 end

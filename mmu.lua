@@ -20,19 +20,19 @@ function MMU.init()
     MMU.rom_size = 0
     
     for i = 1, 0x2000 do MMU.vram[i] = 0 end
-    -- Выделяем память под RAM с огромным запасом (128 КБ)
     for i = 1, 0x20000 do MMU.eram[i] = 0 end
     for i = 1, 0x2000 do MMU.wram[i] = 0 end
     for i = 1, 0xA0 do MMU.oam[i] = 0 end
     for i = 1, 0x80 do MMU.io[i] = 0 end
     for i = 1, 0x80 do MMU.hram[i] = 0 end
+    
+    MMU.io[1] = 0xCF -- Порт 0xFF00 по умолчанию
 end
 
 function MMU.readByte(addr)
     if addr >= 0x0000 and addr <= 0x3FFF then
         return MMU.rom[addr] or 0
     elseif addr >= 0x4000 and addr <= 0x7FFF then
-        -- Защита от выхода за пределы памяти картриджа
         local max_banks = math.floor(MMU.rom_size / 0x4000)
         local bank = MMU.current_rom_bank
         if max_banks > 0 then bank = bank % max_banks end
@@ -44,22 +44,32 @@ function MMU.readByte(addr)
         return MMU.vram[bit.band(addr, 0x1FFF) + 1] or 0
     elseif addr >= 0xA000 and addr <= 0xBFFF then
         if not MMU.eram_enabled then return 0xFF end
-        
-        -- Авто-поддержка встроенной RAM для маппера MBC2
         if MMU.mbc_type == 0x05 or MMU.mbc_type == 0x06 then
             return bit.band(MMU.eram[bit.band(addr, 0x01FF) + 1] or 0, 0x0F)
         end
-        
         local ram_offset = MMU.current_ram_bank * 0x2000
         local ram_addr = ram_offset + bit.band(addr, 0x1FFF) + 1
         return MMU.eram[ram_addr] or 0
     elseif addr >= 0xC000 and addr <= 0xDFFF then
-        return MMU.wram[bit.band(addr, 0x1FFF) + 1] or 0
+        -- Честное чтение WRAM без затирания старших адресов через некорректную маску
+        return MMU.wram[(addr - 0xC000) + 1] or 0
     elseif addr >= 0xE000 and addr <= 0xFDFF then
-        return MMU.wram[bit.band(addr, 0x1FFF) + 1] or 0
+        -- Echo RAM дублирует WRAM
+        return MMU.wram[(addr - 0xE000) + 1] or 0
     elseif addr >= 0xFE00 and addr <= 0xFE9F then
         return MMU.oam[bit.band(addr, 0xFF) + 1] or 0
     elseif addr >= 0xFF00 and addr <= 0xFF7F then
+        -- Честный опрос кнопок джойпада через порт 0xFF00
+        if addr == 0xFF00 then
+            local Joypad = require("joypad")
+            local io_val = MMU.io[1] or 0xCF
+            local res = bit.bor(bit.band(io_val, 0x30), 0x0F)
+            if bit.band(io_val, 0x10) == 0 then res = bit.band(res, Joypad.state_arrows) end
+            if bit.band(io_val, 0x20) == 0 then res = bit.band(res, Joypad.state_buttons) end
+            return bit.bor(res, 0xC0)
+        end
+        
+        -- Чтение регистра статуса звука 0xFF26
         if addr == 0xFF26 then 
             local APU = require("apu")
             local status = 0x70
@@ -81,28 +91,21 @@ end
 function MMU.writeByte(addr, value)
     value = bit.band(value, 0xFF)
 
-    -- Если игра вообще без маппера (размер 32КБ), игнорируем любые попытки переключения банков
     if MMU.rom_size <= 0x8000 then
-        -- Но позволяем стандартную запись в оперативку/видеопамять
         if addr >= 0x8000 then MMU.writeStandard(addr, value) end
         return
     end
 
-    -- 1. Активация внешней оперативной памяти (0x0000 - 0x1FFF)
     if addr >= 0x0000 and addr <= 0x1FFF then
         if MMU.mbc_type == 0x05 or MMU.mbc_type == 0x06 then
-            if bit.band(addr, 0x0100) == 0 then
-                MMU.eram_enabled = (bit.band(value, 0x0F) == 0x0A)
-            end
+            if bit.band(addr, 0x0100) == 0 then MMU.eram_enabled = (bit.band(value, 0x0F) == 0x0A) end
             return
         end
         MMU.eram_enabled = (bit.band(value, 0x0F) == 0x0A)
         return
     end
 
-    -- 2. Переключение банков РОМа (0x2000 - 0x3FFF)
     if addr >= 0x2000 and addr <= 0x3FFF then
-        -- Если это продвинутый MBC5
         if MMU.mbc_type >= 0x19 and MMU.mbc_type <= 0x1E then
             if addr <= 0x2FFF then
                 MMU.current_rom_bank = bit.bor(bit.band(MMU.current_rom_bank, 0x0100), value)
@@ -111,20 +114,17 @@ function MMU.writeByte(addr, value)
                 MMU.current_rom_bank = bit.bor(bit.band(MMU.current_rom_bank, 0xFF), bit.lshift(bit9, 8))
             end
         else
-            -- Универсальный переключатель для MBC1, MBC3 и всех неофициальных пиратских мапперов (включая Соника 0xEA)
-            local bank = bit.band(value, 0x7F) -- Берем расширенную маску до 128 банков
+            local bank = bit.band(value, 0x7F)
             if bank == 0 then bank = 1 end
             MMU.current_rom_bank = bank
         end
         return
     end
 
-    -- 3. Переключение банков оперативной памяти SRAM (0x4000 - 0x5FFF)
     if addr >= 0x4000 and addr <= 0x5FFF then
         if MMU.mbc_type >= 0x19 and MMU.mbc_type <= 0x1E then
-            MMU.current_ram_bank = bit.band(value, 0x0F) -- MBC5 поддерживает до 16 банков RAM
+            MMU.current_ram_bank = bit.band(value, 0x0F)
         else
-            -- Универсально для MBC1 и MBC3 (до 4 банков оперативной памяти)
             local bank = bit.band(value, 0x03)
             MMU.current_ram_bank = bank
             if MMU.mbc1_mode == 0 then
@@ -134,17 +134,14 @@ function MMU.writeByte(addr, value)
         return
     end
 
-    -- 4. Переключение режимов работы (0x6000 - 0x7FFF)
     if addr >= 0x6000 and addr <= 0x7FFF then
         MMU.mbc1_mode = bit.band(value, 0x01)
         return
     end
 
-    -- Запись во все остальные стандартные регистры
     MMU.writeStandard(addr, value)
 end
 
--- Вспомогательная функция стандартной записи
 function MMU.writeStandard(addr, value)
     if addr >= 0x8000 and addr <= 0x9FFF then
         MMU.vram[bit.band(addr, 0x1FFF) + 1] = value
@@ -159,12 +156,18 @@ function MMU.writeStandard(addr, value)
             MMU.eram[ram_addr] = value
         end
     elseif addr >= 0xC000 and addr <= 0xDFFF then
-        MMU.wram[bit.band(addr, 0x1FFF) + 1] = value
+        MMU.wram[(addr - 0xC000) + 1] = value
     elseif addr >= 0xE000 and addr <= 0xFDFF then
-        MMU.wram[bit.band(addr, 0x1FFF) + 1] = value
+        MMU.wram[(addr - 0xE000) + 1] = value
     elseif addr >= 0xFE00 and addr <= 0xFE9F then
         MMU.oam[bit.band(addr, 0xFF) + 1] = value
     elseif addr >= 0xFF00 and addr <= 0xFF7F then
+        if addr == 0xFF00 then
+            -- Запись в джойпад меняет только биты выбора 4 и 5
+            MMU.io[1] = bit.band(value, 0x30)
+            return
+        end
+        
         local io_addr = addr - 0xFF00
         MMU.io[io_addr + 1] = value
         
@@ -189,20 +192,75 @@ function MMU.loadROM(filename)
     MMU.rom_size = size
     for i = 1, size do MMU.rom[i - 1] = string.byte(data, i) end
     
-    -- Считываем тип маппера
     local raw_mbc = MMU.rom[0x0147] or 0
-    
-    -- УМНАЯ АВТО-ПОДСТРОЙКА:
-    -- Если игра большая (больше 32КБ), но заявляет мусорный тип маппера (как Соник 0xEA)
-    -- или заявляет тип 0 (ROM ONLY), мы принудительно переводим её на универсальный MBC1,
-    -- чтобы переключение банков физически работало и игра не зависала.
     if size > 0x8000 and (raw_mbc == 0 or raw_mbc == 0xEA or raw_mbc == 0x88) then
-        MMU.mbc_type = 0x01 -- Включаем режим совместимости с MBC1
+        MMU.mbc_type = 0x01
     else
         MMU.mbc_type = raw_mbc
     end
-    
     print(string.format("ROM Загружен. Размер: %d байт. Режим маппера: 0x%02X", size, MMU.mbc_type))
 end
+
+-- ===================================================================
+-- ФУНКЦИИ ДЛЯ СЕРИАЛИЗАЦИИ СОХРАНЕНИЙ (SAVE STATES)
+-- ===================================================================
+
+function MMU.saveState()
+    local buffer = {}
+    
+    -- Вспомогательная функция для записи массива байт в буфер строки
+    local function writeArray(arr, size)
+        for i = 1, size do table.insert(buffer, string.char(arr[i] or 0)) end
+    end
+
+    -- Записываем все регистры маппера
+    table.insert(buffer, string.char(MMU.current_rom_bank))
+    table.insert(buffer, string.char(MMU.current_ram_bank))
+    table.insert(buffer, string.char(MMU.eram_enabled and 1 or 0))
+    table.insert(buffer, string.char(MMU.mbc1_mode))
+
+    -- Записываем динамические области памяти Game Boy
+    writeArray(MMU.vram, 0x2000)   -- Видеопамять (8 КБ)
+    writeArray(MMU.eram, 0x20000)  -- Внешняя RAM картриджа с запасом (128 КБ)
+    writeArray(MMU.wram, 0x2000)   -- Системная RAM (8 КБ)
+    writeArray(MMU.oam, 0xA0)      -- Спрайты (160 байт)
+    writeArray(MMU.io, 0x80)       -- Регистры ввода-вывода (128 байт)
+    writeArray(MMU.hram, 0x80)     -- Быстрая RAM (128 байт)
+
+    return table.concat(buffer)
+end
+
+function MMU.loadState(stateString)
+    if not stateString or #stateString < 147652 then return false end -- Минимальный размер сейва
+    
+    local offset = 1
+    local function readByte()
+        local val = string.byte(stateString, offset)
+        offset = offset + 1
+        return val
+    end
+
+    local function readArray(arr, size)
+        for i = 1, size do arr[i] = string.byte(stateString, offset + i - 1) or 0 end
+        offset = offset + size
+    end
+
+    -- Восстанавливаем состояние маппера
+    MMU.current_rom_bank = readByte()
+    MMU.current_ram_bank = readByte()
+    MMU.eram_enabled = (readByte() == 1)
+    MMU.mbc1_mode = readByte()
+
+    -- Восстанавливаем массивы памяти
+    readArray(MMU.vram, 0x2000)
+    readArray(MMU.eram, 0x20000)
+    readArray(MMU.wram, 0x2000)
+    readArray(MMU.oam, 0xA0)
+    readArray(MMU.io, 0x80)
+    readArray(MMU.hram, 0x80)
+
+    return true
+end
+
 
 return MMU
