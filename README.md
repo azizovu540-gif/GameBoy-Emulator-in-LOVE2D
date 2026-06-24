@@ -1,6 +1,6 @@
 # 🕹️ Custom Lua Game Boy Emulator from Scratch (LÖVE / Love2D)
 
-A fully custom, high-performance 8-bit Game Boy (DMG-01) emulator written entirely from scratch in Lua using the **LÖVE framework**. This project features a completely custom CPU core, PPU layout, and a newly integrated audio subsystem.
+A fully custom, high-performance 8-bit Game Boy (DMG-01) emulator written entirely from scratch in Lua using the **LÖVE framework**. This project features a completely custom CPU core, PPU layout, and an integrated audio subsystem.
 
 Optimized for **LuaJIT** and ready for both classic games and unlicensed homebrew/bootlegs.
 
@@ -8,16 +8,24 @@ Optimized for **LuaJIT** and ready for both classic games and unlicensed homebre
 
 ## 📸 Screenshots
 
-![Tetris](test.png)
-*Running the absolute classic "Tetris" smoothly with the custom v1.1 audio engine playing the iconic tune.*
+<p align="center">
+  <img src="test.png" width="31%" alt="Tetris Screen" />
+  <img src="zelda.png" width="31%" alt="Zelda Title Screen" />
+  <img src="zelda2.png" width="31%" alt="Zelda Gameplay" />
+</p>
+
+<p align="center">
+  <em>Running "Tetris" and "The Legend of Zelda: Link's Awakening" smoothly at 60 FPS with full audio, input, and save state support.</em>
+</p>
 
 ---
 
-## 🚀 Features (v1.1 Update)
+## 🚀 Features (v1.3 Update)
 
+* **💾 Save States System:** Instantly save and load your exact game state at any microsecond. Perfect for long adventures like Zelda!
 * **🎵 Multi-Channel APU (Audio Core):** Built-in stereo synthesis simulating Square 1, Square 2, and Wave RAM channels. Experience crunchy, raw retro bass and sound effects!
 * **🧠 All-Round Mapper Compatibility:** Smart dynamic cartridge detection. Fully supports **MBC1, MBC2, MBC3, MBC5**, and automatically fixes broken headers in unlicensed bootleg ROMs (like *Sonic 3D Blast 5*).
-* **🏃 Dynamic Frame Synchronization:** Synchronizes CPU cycles perfectly with LÖVE's `deltaTime` and hardware V-Sync. Say goodbye to screen tearing and input lag!
+* **🏃 Dynamic Frame Synchronization:** Synchronizes CPU cycles perfectly with LÖVE's `deltaTime` and hardware V-Sync. No screen tearing and 0 input lag thanks to JIT optimizations!
 * **🎮 Accurate Hardware Input:** Joypad matrix re-engineered directly from official Game Boy hardware registers. Includes plug-and-play gamepad support.
 * **📂 Retro ROM Selector:** Features a clean, custom retro-styled boot menu that automatically scans the directory for your `.gb` files.
 
@@ -42,6 +50,8 @@ Optimized for **LuaJIT** and ready for both classic games and unlicensed homebre
 | **Button B** | `X` | `X` |
 | **START** | `Space` (Spacebar) | `Start` |
 | **SELECT** | `Right Shift` | `Back / Select` |
+| **Quick Save** | `F5` | `L1 + Y` (Hold L1 and press Y) |
+| **Quick Load** | `F6` | `L1 + X` (Hold L1 and press X) |
 | **Exit to Menu** | `Escape` | — |
 
 ---
