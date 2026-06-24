@@ -51,15 +51,12 @@ function MMU.readByte(addr)
         local ram_addr = ram_offset + bit.band(addr, 0x1FFF) + 1
         return MMU.eram[ram_addr] or 0
     elseif addr >= 0xC000 and addr <= 0xDFFF then
-        -- Честное чтение WRAM без затирания старших адресов через некорректную маску
         return MMU.wram[(addr - 0xC000) + 1] or 0
     elseif addr >= 0xE000 and addr <= 0xFDFF then
-        -- Echo RAM дублирует WRAM
         return MMU.wram[(addr - 0xE000) + 1] or 0
     elseif addr >= 0xFE00 and addr <= 0xFE9F then
         return MMU.oam[bit.band(addr, 0xFF) + 1] or 0
     elseif addr >= 0xFF00 and addr <= 0xFF7F then
-        -- Честный опрос кнопок джойпада через порт 0xFF00
         if addr == 0xFF00 then
             local Joypad = require("joypad")
             local io_val = MMU.io[1] or 0xCF
@@ -69,13 +66,14 @@ function MMU.readByte(addr)
             return bit.bor(res, 0xC0)
         end
         
-        -- Чтение регистра статуса звука 0xFF26
+        -- ИСПРАВЛЕНО: Чтение статуса с учетом 4-го аудиоканала
         if addr == 0xFF26 then 
             local APU = require("apu")
             local status = 0x70
             if APU.ch1_enabled then status = bit.bor(status, 0x01) end
             if APU.ch2_enabled then status = bit.bor(status, 0x02) end
             if APU.ch3_enabled then status = bit.bor(status, 0x04) end
+            if APU.ch4_enabled then status = bit.bor(status, 0x08) end
             status = bit.bor(status, bit.band(MMU.io[(0xFF26 - 0xFF00) + 1] or 0, 0x80))
             return status
         end
@@ -163,7 +161,6 @@ function MMU.writeStandard(addr, value)
         MMU.oam[bit.band(addr, 0xFF) + 1] = value
     elseif addr >= 0xFF00 and addr <= 0xFF7F then
         if addr == 0xFF00 then
-            -- Запись в джойпад меняет только биты выбора 4 и 5
             MMU.io[1] = bit.band(value, 0x30)
             return
         end
@@ -204,34 +201,29 @@ end
 -- ===================================================================
 -- ФУНКЦИИ ДЛЯ СЕРИАЛИЗАЦИИ СОХРАНЕНИЙ (SAVE STATES)
 -- ===================================================================
-
 function MMU.saveState()
     local buffer = {}
-    
-    -- Вспомогательная функция для записи массива байт в буфер строки
     local function writeArray(arr, size)
         for i = 1, size do table.insert(buffer, string.char(arr[i] or 0)) end
     end
 
-    -- Записываем все регистры маппера
     table.insert(buffer, string.char(MMU.current_rom_bank))
     table.insert(buffer, string.char(MMU.current_ram_bank))
     table.insert(buffer, string.char(MMU.eram_enabled and 1 or 0))
     table.insert(buffer, string.char(MMU.mbc1_mode))
 
-    -- Записываем динамические области памяти Game Boy
-    writeArray(MMU.vram, 0x2000)   -- Видеопамять (8 КБ)
-    writeArray(MMU.eram, 0x20000)  -- Внешняя RAM картриджа с запасом (128 КБ)
-    writeArray(MMU.wram, 0x2000)   -- Системная RAM (8 КБ)
-    writeArray(MMU.oam, 0xA0)      -- Спрайты (160 байт)
-    writeArray(MMU.io, 0x80)       -- Регистры ввода-вывода (128 байт)
-    writeArray(MMU.hram, 0x80)     -- Быстрая RAM (128 байт)
+    writeArray(MMU.vram, 0x2000)
+    writeArray(MMU.eram, 0x20000)
+    writeArray(MMU.wram, 0x2000)
+    writeArray(MMU.oam, 0xA0)
+    writeArray(MMU.io, 0x80)
+    writeArray(MMU.hram, 0x80)
 
     return table.concat(buffer)
 end
 
 function MMU.loadState(stateString)
-    if not stateString or #stateString < 147652 then return false end -- Минимальный размер сейва
+    if not stateString or #stateString < 147652 then return false end
     
     local offset = 1
     local function readByte()
@@ -245,13 +237,11 @@ function MMU.loadState(stateString)
         offset = offset + size
     end
 
-    -- Восстанавливаем состояние маппера
     MMU.current_rom_bank = readByte()
     MMU.current_ram_bank = readByte()
     MMU.eram_enabled = (readByte() == 1)
     MMU.mbc1_mode = readByte()
 
-    -- Восстанавливаем массивы памяти
     readArray(MMU.vram, 0x2000)
     readArray(MMU.eram, 0x20000)
     readArray(MMU.wram, 0x2000)
@@ -261,6 +251,5 @@ function MMU.loadState(stateString)
 
     return true
 end
-
 
 return MMU

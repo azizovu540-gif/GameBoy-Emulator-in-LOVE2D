@@ -150,52 +150,71 @@ local function handleInterrupts()
     end
 end
 
+-- Вынеси накопитель времени в глобальную область (выше love.update)
+local time_accumulator = 0
+
 function love.update(dt)
     if current_state == STATE_MENU then return end
     if CPU.halted_by_error then return end
 
-    -- Жестко ограничиваем шаг времени во избежание зависаний (макс 30 FPS на шаг)
-    if dt > 0.033 then dt = 0.033 end
+    -- 1. Защита от "скачков" времени при лагах (максимум 8 кадров за раз)
+    if dt > 0.25 then dt = 0.25 end
+    time_accumulator = time_accumulator + dt
 
-    -- Рассчитываем точное количество тактов процессора для текущей дельты времени (4.194304 МГц)
-    local cycles_to_run = math.floor(4194304 * dt)
-    local cycles_spent = 0
-    
-    local current_ly = mmu_read(0xFF44)
-    local line_cycles = 0
+    -- Длина одного идеального кадра Game Boy (1 / 59.73 Гц)
+    local target_frame_time = 0.01674
 
-    while cycles_spent < cycles_to_run do
-        handleInterrupts()
+    -- 2. Крутим логику строго фиксированными шагами
+    while time_accumulator >= target_frame_time do
+        time_accumulator = time_accumulator - target_frame_time
         
-        -- Прямой вызов без pcall ради максимальной скорости (Full 60 FPS)
-        local cycles = cpu_step() or 4
-        cycles_spent = cycles_spent + cycles
-        line_cycles = line_cycles + cycles
+        -- Ровно 70224 такта процессора тратится на 1 полный кадр Game Boy
+        local cycles_to_run = 70224
+        local cycles_spent = 0
+        local line_cycles = 0
+        local current_ly = mmu_read(0xFF44)
 
-        local stat = mmu_read(0xFF41)
-        if current_ly >= 144 then stat = bit.bor(bit.band(stat, 0xFC), 1)
-        elseif line_cycles < 80 then stat = bit.bor(bit.band(stat, 0xFC), 2)
-        elseif line_cycles < 252 then stat = bit.bor(bit.band(stat, 0xFC), 3)
-        else stat = bit.band(stat, 0xFC) end
-        mmu_write(0xFF41, stat)
+        while cycles_spent < cycles_to_run do
+            handleInterrupts()
+            
+            local cycles = cpu_step() or 4
+            cycles_spent = cycles_spent + cycles
+            line_cycles = line_cycles + cycles
 
-        if line_cycles >= 456 then
-            -- Опрашиваем джойпад один раз на отрисовку строки, а не на каждый такт
-            Joypad.update()
+            -- Менеджер статусов прерываний LCD
+            local stat = mmu_read(0xFF41)
+            if current_ly >= 144 then stat = bit.bor(bit.band(stat, 0xFC), 1)
+            elseif line_cycles < 80 then stat = bit.bor(bit.band(stat, 0xFC), 2)
+            elseif line_cycles < 252 then stat = bit.bor(bit.band(stat, 0xFC), 3)
+            else stat = bit.band(stat, 0xFC) end
+            mmu_write(0xFF41, stat)
 
-            line_cycles = line_cycles - 456
-            current_ly = current_ly + 1
-            if current_ly == 144 then
-                local flag = mmu_read(0xFF0F)
-                mmu_write(0xFF0F, bit.bor(flag, 1))
-            elseif current_ly > 153 then
-                current_ly = 0
+            -- Ровно 456 тактов на одну горизонтальную линию
+            if line_cycles >= 456 then
+                line_cycles = line_cycles - 456
+                current_ly = current_ly + 1
+                
+                if current_ly == 144 then
+                    local flag = mmu_read(0xFF0F)
+                    mmu_write(0xFF0F, bit.bor(flag, 1)) -- Триггерим V-Blank
+                elseif current_ly > 153 then
+                    current_ly = 0
+                end
+                
+                mmu_write(0xFF44, current_ly)
+                
+                -- Рендерим строку только в активной области экрана
+                if current_ly <= 143 then 
+                    ppu_render(current_ly) 
+                end
             end
-            mmu_write(0xFF44, current_ly)
-            if current_ly <= 143 then ppu_render(current_ly) end
         end
+        
+        -- Обновляем управление строго один раз за целый кадр
+        Joypad.update()
     end
 
+    -- 3. Генерируем звук для текущего кадра
     if current_state == STATE_EMU then
         APU.generateFrameAudio()
     end
