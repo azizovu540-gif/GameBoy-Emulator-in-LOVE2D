@@ -54,7 +54,6 @@ local function startEmulation(filename)
     love.window.setTitle("Playing: " .. filename)
 end
 
--- Вспомогательная функция физической записи файла быстрого сохранения (Save State)
 local function executeSave()
     local cpuState = {
         a = CPU.a, f = CPU.f, b = CPU.b, c = CPU.c,
@@ -62,44 +61,29 @@ local function executeSave()
         pc = CPU.pc, sp = CPU.sp, ime = CPU.ime and 1 or 0,
         halted = CPU.halted and 1 or 0
     }
-    
     local mmuData = MMU.saveState()
-    
-    -- Упаковываем состояние процессора в текстовый заголовок в начале файла
     local cpuHeader = string.format("%02X|%02X|%02X|%02X|%02X|%02X|%02X|%02X|%04X|%04X|%d|%d\n",
         cpuState.a, cpuState.f, cpuState.b, cpuState.c,
         cpuState.d, cpuState.e, cpuState.h, cpuState.l,
         cpuState.pc, cpuState.sp, cpuState.ime, cpuState.halted
     )
-    
     local save_name = current_rom_filename:gsub("%.gb$", "") .. ".state"
     local success = love.filesystem.write(save_name, cpuHeader .. mmuData)
-    if success then
-        print("Save State успешно создан: " .. save_name)
-    end
+    if success then print("Save State успешно создан: " .. save_name) end
 end
 
--- Вспомогательная функция чтения файла быстрого сохранения (Load State)
 local function executeLoad()
     local save_name = current_rom_filename:gsub("%.gb$", "") .. ".state"
     if love.filesystem.getInfo(save_name) then
         local fileData = love.filesystem.read(save_name)
         local newlineIndex = fileData:find("\n")
-        
         if newlineIndex then
             local header = fileData:sub(1, newlineIndex - 1)
             local mmuData = fileData:sub(newlineIndex + 1)
-            
-            -- Восстанавливаем массивы оперативной памяти через MMU
             local mmuSuccess = MMU.loadState(mmuData)
-            
             if mmuSuccess then
-                -- Восстанавливаем внутреннее состояние регистров процессора
                 local parts = {}
-                for token in string.gmatch(header, "[^|]+") do
-                    table.insert(parts, token)
-                end
-                
+                for token in string.gmatch(header, "[^|]+") do table.insert(parts, token) end
                 CPU.a = tonumber(parts[1], 16)
                 CPU.f = tonumber(parts[2], 16)
                 CPU.b = tonumber(parts[3], 16)
@@ -112,7 +96,6 @@ local function executeLoad()
                 CPU.sp = tonumber(parts[10], 16)
                 CPU.ime = (tonumber(parts[11]) == 1)
                 CPU.halted = (tonumber(parts[12]) == 1)
-                
                 print("Save State успешно загружен!")
             end
         end
@@ -120,7 +103,6 @@ local function executeLoad()
         print("Файл сохранения не найден!")
     end
 end
-
 local function handleInterrupts()
     local flag = mmu_read(0xFF0F)
     local enable = mmu_read(0xFFFF)
@@ -150,25 +132,20 @@ local function handleInterrupts()
     end
 end
 
--- Вынеси накопитель времени в глобальную область (выше love.update)
 local time_accumulator = 0
 
 function love.update(dt)
     if current_state == STATE_MENU then return end
     if CPU.halted_by_error then return end
 
-    -- 1. Защита от "скачков" времени при лагах (максимум 8 кадров за раз)
     if dt > 0.25 then dt = 0.25 end
     time_accumulator = time_accumulator + dt
 
-    -- Длина одного идеального кадра Game Boy (1 / 59.73 Гц)
     local target_frame_time = 0.01674
 
-    -- 2. Крутим логику строго фиксированными шагами
     while time_accumulator >= target_frame_time do
         time_accumulator = time_accumulator - target_frame_time
         
-        -- Ровно 70224 такта процессора тратится на 1 полный кадр Game Boy
         local cycles_to_run = 70224
         local cycles_spent = 0
         local line_cycles = 0
@@ -181,12 +158,44 @@ function love.update(dt)
             cycles_spent = cycles_spent + cycles
             line_cycles = line_cycles + cycles
 
-            -- Менеджер статусов прерываний LCD
+            -- Менеджер статусов прерываний LCD (STAT)
             local stat = mmu_read(0xFF41)
-            if current_ly >= 144 then stat = bit.bor(bit.band(stat, 0xFC), 1)
-            elseif line_cycles < 80 then stat = bit.bor(bit.band(stat, 0xFC), 2)
-            elseif line_cycles < 252 then stat = bit.bor(bit.band(stat, 0xFC), 3)
-            else stat = bit.band(stat, 0xFC) end
+            local mode = 0
+            
+            if current_ly >= 144 then 
+                mode = 1 -- V-Blank
+            elseif line_cycles < 80 then 
+                mode = 2 -- OAM Search
+            elseif line_cycles < 252 then 
+                mode = 3 -- Data Transfer
+            else 
+                mode = 0 -- H-Blank
+            end
+            
+            -- Проверяем совпадение LY == LYC
+            local lyc = mmu_read(0xFF45)
+            local lyc_stat = (current_ly == lyc)
+            if lyc_stat then
+                stat = bit.bor(stat, 0x04)
+                -- Если включено прерывание по совпадению LYC (Бит 6), дергаем STAT-прерывание
+                if bit.band(stat, 0x40) ~= 0 then
+                    mmu_write(0xFF0F, bit.bor(mmu_read(0xFF0F), 0x02))
+                end
+            else
+                stat = bit.band(stat, bit.bnot(0x04))
+            end
+
+            -- Дергаем STAT-прерывание при смене режимов экрана
+            local old_mode = bit.band(stat, 0x03)
+            if mode ~= old_mode then
+                if (mode == 0 and bit.band(stat, 0x08) ~= 0) or    -- H-Blank Interrupt (Bit 3)
+                   (mode == 1 and bit.band(stat, 0x10) ~= 0) or    -- V-Blank STAT Interrupt (Bit 4)
+                   (mode == 2 and bit.band(stat, 0x20) ~= 0) then  -- OAM STAT Interrupt (Bit 5)
+                    mmu_write(0xFF0F, bit.bor(mmu_read(0xFF0F), 0x02))
+                end
+            end
+
+            stat = bit.bor(bit.band(stat, 0xFC), mode)
             mmu_write(0xFF41, stat)
 
             -- Ровно 456 тактов на одну горизонтальную линию
@@ -195,26 +204,22 @@ function love.update(dt)
                 current_ly = current_ly + 1
                 
                 if current_ly == 144 then
-                    local flag = mmu_read(0xFF0F)
-                    mmu_write(0xFF0F, bit.bor(flag, 1)) -- Триггерим V-Blank
+                    mmu_write(0xFF0F, bit.bor(mmu_read(0xFF0F), 0x01)) -- Триггерим V-Blank
                 elseif current_ly > 153 then
                     current_ly = 0
                 end
                 
                 mmu_write(0xFF44, current_ly)
                 
-                -- Рендерим строку только в активной области экрана
                 if current_ly <= 143 then 
                     ppu_render(current_ly) 
                 end
             end
         end
         
-        -- Обновляем управление строго один раз за целый кадр
         Joypad.update()
     end
 
-    -- 3. Генерируем звук для текущего кадра
     if current_state == STATE_EMU then
         APU.generateFrameAudio()
     end
@@ -263,7 +268,6 @@ function love.draw()
     end
 end
 
--- Обработка управления с клавиатуры ПК
 function love.keypressed(key)
     if current_state == STATE_MENU then
         if key == "up" then
@@ -289,24 +293,23 @@ function love.keypressed(key)
     end
 end
 
--- Обработка управления с внешнего геймпада (XInput / Xbox / DualShock)
 function love.gamepadpressed(joystick, button)
     if current_state == STATE_MENU then
         if button == "dpup" then
             selected_index = selected_index - 1
             if selected_index < 1 then selected_index = #rom_list end
         elseif button == "dpdown" then
+            selected_index = selected_index + 1
             if selected_index > #rom_list then selected_index = 1 end
         elseif button == "a" and #rom_list > 0 then
             startEmulation(rom_list[selected_index])
         end
     else
-        -- Горячие кнопки сохранения/загрузки для геймпада во время игры
-        if joystick:isGamepadDown("leftshoulder") then -- Удерживаем L1
+        if joystick:isGamepadDown("leftshoulder") then
             if button == "y" then
-                executeSave() -- L1 + Y -> Быстрое сохранение
+                executeSave()
             elseif button == "x" then
-                executeLoad() -- L1 + X -> Быстрая загрузка
+                executeLoad()
             end
         end
     end
