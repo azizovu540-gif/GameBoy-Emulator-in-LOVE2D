@@ -42,3 +42,4 @@ If you are interested in improving this codebase, fixing remaining issues, or ex
 
 Thank you to everyone who checked out the project, tested it, or supported its development!
 
+![](rip.png)
