@@ -29,5 +29,16 @@ A custom-built, high-performance 8-bit Game Boy (DMG-01) emulator written in Lua
 
 **Controls:** Arrows (Move), Z (A), X (B), Space (Start), Shift (Select).
 
-## 📜 License
-Educational project with a custom codebase. No ROMs included.
+
+---
+
+## 🛑 Project Status & Maintenance
+
+**This project is archived and no longer maintained.**
+
+Due to personal time constraints, I am no longer able to roll out updates, fix bugs, or actively develop this emulator. The project has successfully fulfilled its educational goals and will remain available in read-only mode as a reference for the community.
+
+If you are interested in improving this codebase, fixing remaining issues, or expanding its features, you are highly encouraged to **Fork** this repository and continue development in your own space. 
+
+Thank you to everyone who checked out the project, tested it, or supported its development!
+
